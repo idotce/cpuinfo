@@ -1,0 +1,12 @@
+
+CROSS_COMPILE = aarch64-linux-gnu-
+
+CFLAGS = $(DEFINES) $(INCLUDES) \
+	-O3 -Wall -std=c99 -mcpu=cortex-a53
+
+CXXFLAGS = $(DEFINES) $(INCLUDES) \
+	-O3 -Wall -std=c++11 -mcpu=cortex-a53
+
+LDFLAGS = $(LIBS) -static
+
+# TARGET = $(TARGET).arm64
