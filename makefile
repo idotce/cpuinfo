@@ -15,7 +15,7 @@ DEFINES = \
 	-D_GNU_SOURCE
 
 INCLUDES = \
-	-I.
+	-Isrc
 
 LIBS =
 #LIBS = -lgdi32 -lopengl32 -lglu32
