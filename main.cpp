@@ -1,103 +1,153 @@
 #include <stdio.h>
-#include <sched.h> // for sched_setaffinity()
-#include <unistd.h> // for getpid()
-#include <sys/types.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <inttypes.h>
 #include <sched.h>
 #include <time.h>
-using namespace std;
 
 #include "Eigen/Core"
-#include "Eigen/Dense"
-#include "Eigen/Sparse"
-using namespace Eigen;
+#include "Eigen/SparseCore"
 
-#ifdef __cplusplus
 extern "C" {
-#endif
 #include "board.h"
 #include "cpu.h"
-#ifdef __cplusplus
 }
-#endif
 
-void set_cpu() {
-    cpu_set_t cpu_set;
-    CPU_ZERO(&cpu_set);
-    CPU_SET(0, &cpu_set);
-    sched_setaffinity(getpid(), sizeof(cpu_set_t), &cpu_set);
-    printf("sched_getcpu = %d\n", sched_getcpu());
+static void set_cpu() {
+    cpu_set_t allowed;
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+        perror("sched_getaffinity");
+        return;
+    }
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &allowed))
+            continue;
+        cpu_set_t selected;
+        CPU_ZERO(&selected);
+        CPU_SET(cpu, &selected);
+        if (sched_setaffinity(0, sizeof(selected), &selected) != 0) {
+            perror("sched_setaffinity");
+            return;
+        }
+        printf("benchmark cpu = %d\n", cpu);
+        return;
+    }
+    fprintf(stderr, "No available CPU for affinity\n");
 }
 
 static int64_t time_us() {
     struct timespec tv;
-    clock_gettime(CLOCK_MONOTONIC, &tv); // CLOCK_REALTIME CLOCK_MONOTONIC
-    return (int64_t)tv.tv_sec*1000000 + tv.tv_nsec/1000;
+    if (clock_gettime(CLOCK_MONOTONIC, &tv) != 0) {
+        perror("clock_gettime");
+        exit(EXIT_FAILURE);
+    }
+    return (int64_t)tv.tv_sec * 1000000 + tv.tv_nsec / 1000;
 }
 
-double calculate_pi(int accuracy) {
-     double result = 1;
-     int a = 2;
-     int b = 1;
-     for(int i = 0; i < accuracy; i ++){
-          result = (a/(double)b) * result;
-          if(a < b){
-               a = a + 2;
-          }
-          else if(b < a){
-               b = b + 2;
-          }
-     }
-     return result * 2;
+static void print_eigen_info() {
+    printf("Eigen %d.%d.%d, pointer bits = %zu, max align bytes = %d\n",
+           EIGEN_WORLD_VERSION, EIGEN_MAJOR_VERSION, EIGEN_MINOR_VERSION,
+           sizeof(void*) * 8, EIGEN_MAX_ALIGN_BYTES);
+    // These describe this build, not all features supported by the CPU.
+    printf("Eigen compile-time SIMD:");
+#ifdef EIGEN_VECTORIZE_SSE2
+    printf(" SSE2");
+#endif
+#ifdef EIGEN_VECTORIZE_AVX
+    printf(" AVX");
+#endif
+#ifdef EIGEN_VECTORIZE_AVX2
+    printf(" AVX2");
+#endif
+#ifdef EIGEN_VECTORIZE_AVX512
+    printf(" AVX512");
+#endif
+#ifdef EIGEN_VECTORIZE_NEON
+    printf(" NEON");
+#endif
+#ifndef EIGEN_VECTORIZE
+    printf(" disabled");
+#endif
+    printf("\n");
 }
 
-int main(int argc, char* argv[])
-{
-    rpiz_fields *bf, *pf;
+template <typename Scalar>
+static void benchmark_matrix(const char *label) {
+    const int size = 32;
+    const int iterations = 10000;
+    Eigen::Matrix<Scalar, size, size> a, b, c;
+    a.setRandom();
+    b.setRandom();
+    c.noalias() = a * b;
+
+    // Consume each result so the repeated products remain observable.
+    volatile Scalar checksum = Scalar(0);
+    int64_t start = time_us();
+    for (int i = 0; i < iterations; ++i) {
+        a(0, 0) = Scalar(1) + Scalar(i) / Scalar(iterations);
+        c.noalias() = a * b;
+        checksum += c(i % size, i % size);
+    }
+    int64_t elapsed = time_us() - start;
+    printf("%s %dx%d iterations=%d time=%" PRId64 "us checksum=%.9g\n",
+           label, size, size, iterations, elapsed, (double)checksum);
+
+    const int dim = 132;
+    typedef Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> Matrix;
+    Matrix d1 = Matrix::Random(dim, dim);
+    Matrix d2 = Matrix::Random(dim, dim);
+    start = time_us();
+    Matrix d3 = d1 * d2 * d1.transpose();
+    elapsed = time_us() - start;
+    printf("%s ABAt %dx%d time=%" PRId64 "us checksum=%.9g\n",
+           label, dim, dim, elapsed, (double)d3.sum());
+}
+
+template <typename Scalar>
+static void benchmark_sparse(const char *label) {
+    const int dim = 132;
+    typedef Eigen::SparseMatrix<Scalar> SparseMatrix;
+    SparseMatrix a(dim, dim), b(dim, dim);
+    a.reserve(Eigen::VectorXi::Constant(dim, 3));
+    b.reserve(Eigen::VectorXi::Constant(dim, 3));
+    for (int col = 0; col < dim; ++col) {
+        if (col > 0) {
+            a.insert(col - 1, col) = Scalar(-0.25);
+            b.insert(col - 1, col) = Scalar(0.5);
+        }
+        a.insert(col, col) = Scalar(2);
+        b.insert(col, col) = Scalar(1);
+        if (col + 1 < dim) {
+            a.insert(col + 1, col) = Scalar(-0.25);
+            b.insert(col + 1, col) = Scalar(0.5);
+        }
+    }
+    a.makeCompressed();
+    b.makeCompressed();
+
+    int64_t start = time_us();
+    SparseMatrix c = a * b;
+    int64_t elapsed = time_us() - start;
+    printf("%s sparse %dx%d time=%" PRId64 "us nnz=%ld checksum=%.9g\n",
+           label, dim, dim, elapsed, (long)c.nonZeros(), (double)c.sum());
+}
+
+int main() {
     board_init();
     cpu_init();
-    bf = board_fields();
-    fields_dump(bf);
-    pf = cpu_fields();
-    fields_dump(pf);
+    fields_dump(board_fields());
+    fields_dump(cpu_fields());
     board_cleanup();
     cpu_cleanup();
 
     set_cpu();
-#ifdef __CUDACC__
-    printf("__CUDACC__\n");
-#endif
-#if (defined __ARM_NEON) || (defined __ARM_NEON__)
-    printf("__ARM_NEON\n");
-#endif
-#if defined(__aarch64__)
-  #define ARCH_ARM64 1
-#else
-  #define ARCH_ARM64 0
-#endif
-    printf("__aarch64__ = %d\n", ARCH_ARM64);
-    #define align ((32+3)/4*4)
-    printf("align = %d\n", align);
-
-    Eigen::Matrix<double, align, align> a(align, align);
-    Eigen::Matrix<double, align, align> b(align, align);
-    Eigen::Matrix<double, align, align> c(align, align);
-    Eigen::MatrixXd d(align, align);
-    int64_t s1 = time_us();
-    for (int i=0; i<10000; i++) {
-        a.setIdentity();
-        b.setIdentity();
-        c = a * b;
-    }
-    printf("double time=%ldus\n", time_us()-s1);
-
-    int dim = 132;
-    MatrixXd d1(dim, dim);
-    MatrixXd d2(dim, dim);
-    d1.setIdentity();
-    d2.setIdentity();
-    int64_t s2 = time_us();
-    MatrixXd d3 = d1*d2*d1.transpose();
-    printf("double ABAt time=%ldus\n", time_us()-s2);
-
+    print_eigen_info();
+    // Use the same random sequence for both scalar types.
+    srand(1);
+    benchmark_matrix<double>("double");
+    srand(1);
+    benchmark_matrix<float>("float");
+    benchmark_sparse<double>("double");
+    benchmark_sparse<float>("float");
     return 0;
 }
